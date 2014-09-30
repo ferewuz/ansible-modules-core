@@ -1,0 +1,282 @@
+#!/usr/bin/python
+# This file is part of Ansible
+#
+# Ansible is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# Ansible is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with Ansible.  If not, see <http://www.gnu.org/licenses/>.
+
+DOCUMENTATION = '''
+---
+module: linode_dns
+short_description: create / delete a DNS record Linode Public Cloud
+description:
+     - creates / deletes a Linode Public Cloud DNS record.
+version_added: "dev"
+options:
+  state:
+    description:
+     - Indicate desired state of the resource
+    default: present
+    choices: ['present', 'absent']
+  api_key:
+    description:
+     - Linode API key
+    default: null
+  name:
+    description:
+     - Name of domain
+    type: string
+  domain_type:
+    description:
+     - Name of domain
+    type: string
+    default: master
+    choices: ['master', 'slave']
+  soa_email:
+    description:
+     - Start Of Authority email address (required for master domain)
+    default: null
+    type: string
+  refresh_sec:
+    description:
+     - Domain refresh seconds.
+    default: null
+    type: integer
+  retry_sec:
+    description:
+     - Domain retry seconds.
+    default: null
+    type: integer
+  expire_sec:
+    description:
+     - Domain expire seconds.
+    default: null
+    type: integer
+  ttl_sec:
+    description:
+     - Domain ttl seconds.
+    default: null
+    type: integer
+  status:
+    description:
+     - Domain status.
+    default: null
+    choices: [active, edit_mode, disabled]
+    type: string
+  master_ips:
+    description:
+     - List of master domain IPs (required for slave domains)
+    default: null
+    type: comma separated strings
+requirements: [ "linode-python", "pycurl" ]
+author: Vanc Levstik
+notes:
+  - LINODE_API_KEY env variable can be used instead of api_key.
+'''
+
+EXAMPLES = '''
+# Create a domain
+- local_action:
+     module: linode_domain
+     api_key: 'longStringFromLinodeApi'  # LINODE_API_KEY env variable can be used
+     state = active
+     name = bar.com
+     hostname = www
+     domain_type = master
+     soa_email = foo@bar.com
+     ip = 1.1.1.1
+     ttl_sec = 28800
+     status = active
+
+# Delete a domain
+- local_action:
+     module: linode_domain
+     api_key: 'longStringFromLinodeApi'  # LINODE_API_KEY env variable can be used
+     state = absent
+     name = bar.com
+'''
+
+import sys
+import os
+
+try:
+    import pycurl
+except ImportError:
+    print("failed=True msg='pycurl required for this module'")
+    sys.exit(1)
+
+
+try:
+    from linode import api as linode_api
+except ImportError:
+    print("failed=True msg='linode-python required for this module'")
+    sys.exit(1)
+
+STATUSES = {
+    'disabled': 0,
+    'active': 1,
+    'edit_mode': 2,
+}
+
+
+def get_optional_args(refresh_sec, retry_sec, expire_sec, ttl_sec):
+    kwargs = {}
+    if refresh_sec:
+        kwargs['Refresh_sec'] = refresh_sec
+    if retry_sec:
+        kwargs['Retry_sec'] = retry_sec
+    if expire_sec:
+        kwargs['Expire_sec'] = expire_sec
+    if ttl_sec:
+        kwargs['TTL_sec'] = ttl_sec
+    return kwargs
+
+
+def find_domain(api, name):
+    domains = api.domain_list()
+    # Get ID of domain with that name
+    return next(
+        (domain['DOMAINID'] for domain in domains
+            if domain['DOMAIN'] == name),
+        None
+    )
+
+
+def linodeDNS(module, api, state, name, hostname, domain_type, ip, soa_email,
+              refresh_sec, retry_sec, expire_sec, ttl_sec, status, master_ips):
+
+    if state == 'present':
+        if not ip:
+            module.exit_json(
+                changed=False,
+                msg="You need to provide IP when creating domain record."
+            )
+
+        kwargs = get_optional_args(refresh_sec, retry_sec, expire_sec, ttl_sec)
+
+        if domain_type == 'master':
+            if not soa_email:
+                module.exit_json(
+                    changed=False,
+                    msg="For master domain, SOA email must be provided."
+                )
+            domain_id = find_domain(api, name)
+
+            if not domain_id:
+                try:
+                    result = api.domain_create(
+                        Domain=name,
+                        Type=domain_type,
+                        SOA_Email=soa_email,
+                        status=STATUSES[status],
+                        **kwargs
+                    )
+                except Exception, e:
+                    module.fail_json(msg='%s' % e.value[0]['ERRORMESSAGE'])
+
+                domain_id = result['DomainID']
+
+            try:
+                api.domain_resource_create(
+                    DomainID=domain_id,
+                    Type='A',
+                    Target=ip,
+                    Name=hostname,
+                )
+            except Exception, e:
+                module.fail_json(msg='%s' % e.value[0]['ERRORMESSAGE'])
+
+            module.exit_json(changed=True)
+
+        if domain_type == 'slave':
+            if not master_ips:
+                module.exit_json(
+                    changed=False,
+                    msg="For slave domain, master_ips must be provided."
+                )
+            try:
+                api.domain_create(
+                    Domain=name,
+                    Type=domain_type,
+                    status=status,
+                    master_ips=master_ips,
+                    **kwargs
+                )
+            except Exception, e:
+                module.fail_json(msg='%s' % e.value[0]['ERRORMESSAGE'])
+
+    elif state == 'absent':
+
+        domain_id = find_domain(api, name)
+        if not domain_id:
+            module.exit_json(
+                changed=False,
+                msg="There is no domain with name {}.".format(name)
+            )
+        api.domain_delete(DomainID=domain_id)
+        module.exit_json(changed=True)
+
+
+def main():
+    module = AnsibleModule(
+        argument_spec=dict(
+            state=dict(default='present', choices=['present', 'absent']),
+            api_key=dict(aliases=['API_KEY'], no_log=True),
+            name=dict(required=True, type='str'),
+            hostname=dict(default='', type='str'),
+            domain_type=dict(type='str', default='master', choices=['master', 'slave']),
+            soa_email=dict(type='str'),
+            ip=dict(type='str'),
+            refresh_sec=dict(type='int'),
+            retry_sec=dict(type='int'),
+            expire_sec=dict(type='int'),
+            ttl_sec=dict(type='int'),
+            status=dict(type='str', default='active', choices=['active', 'edit_mode', 'disabled']),
+            master_ips=dict(type='str')
+        )
+    )
+
+    api_key = module.params.get('api_key')
+    state = module.params.get('state')
+    name = module.params.get('name')
+    hostname = module.params.get('hostname')
+    domain_type = module.params.get('domain_type')
+    soa_email = module.params.get('soa_email')
+    ip = module.params.get('ip')
+    refresh_sec = module.params.get('refresh_sec')
+    retry_sec = module.params.get('retry_sec')
+    expire_sec = module.params.get('expire_sec')
+    ttl_sec = module.params.get('ttl_sec')
+    status = module.params.get('status')
+    master_ips = module.params.get('master_ips')
+
+    # Setup the api_key
+    if not api_key:
+        try:
+            api_key = os.environ['LINODE_API_KEY']
+        except KeyError, e:
+            module.fail_json(msg='Unable to load %s' % e.message)
+
+    # setup the auth
+    try:
+        api = linode_api.Api(api_key)
+        api.test_echo()
+    except Exception, e:
+        module.fail_json(msg='%s' % e.value[0]['ERRORMESSAGE'])
+
+    linodeDNS(module, api, state, name, hostname, domain_type, ip, soa_email,
+              refresh_sec, retry_sec, expire_sec, ttl_sec, status, master_ips)
+
+# import module snippets
+from ansible.module_utils.basic import *
+
+main()
